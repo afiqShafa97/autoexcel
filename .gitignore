@@ -1,3 +1,4 @@
 test.xlsx
 data.xlsx
 ~$test.xlsx
+*.xlsx
