@@ -35,7 +35,17 @@ def excel_is_ready(excel):
         return False
 
 
-def find_rightmost_column_by_keywords(ws, used):
+def find_column_by_keyword(ws, used, keyword):
+    """Find column index by header keyword (case-insensitive)"""
+    for r in range(1, used.Rows.Count + 1):
+        for c in range(1, used.Columns.Count + 1):
+            val = ws.Cells(r, c).Value
+            if isinstance(val, str) and keyword in val.lower():
+                return c
+    return None
+
+
+def find_rightmost_column(ws, used):
     for r in range(1, used.Rows.Count + 1):
         for c in range(1, used.Columns.Count + 1):
             val = ws.Cells(r, c).Value
@@ -47,19 +57,19 @@ def find_rightmost_column_by_keywords(ws, used):
 
 
 def find_mulai_selesai_columns(ws, used, max_col):
-    cols = set()
+    cols = []
     for r in range(1, used.Rows.Count + 1):
-        for c in range(1, max_col + 1):
+        for c in range(1, max_col):
             val = ws.Cells(r, c).Value
             if isinstance(val, str):
                 t = val.lower()
                 if "mulai" in t or "selesai" in t:
-                    cols.add(c)
-    return sorted(cols)
+                    cols.append(c)
+    return list(set(cols))
 
 
-def find_nearest_formula_above(ws, col, start_row):
-    for r in range(start_row - 1, 0, -1):
+def find_nearest_formula_above(ws, col, row):
+    for r in range(row - 1, 0, -1):
         cell = ws.Cells(r, col)
         if cell.HasFormula:
             return r
@@ -69,7 +79,7 @@ def find_nearest_formula_above(ws, col, start_row):
 excel = get_excel_app()
 wb = None
 
-print("Script running (RACE-SAFE logic, formula-only autofill)...")
+print("Script running (Tanggal-driven logic, autofill twice with recolor)...")
 
 # ---------- MAIN LOOP ----------
 while True:
@@ -90,84 +100,91 @@ while True:
             time.sleep(1)
             continue
 
-        ws = wb.ActiveSheet
+        ws = excel.ActiveSheet
         used = ws.UsedRange
 
-        max_col = find_rightmost_column_by_keywords(ws, used)
-        if max_col is None:
+        # ---- FIND REQUIRED COLUMNS ----
+        tanggal_col = find_column_by_keyword(ws, used, "tanggal")
+        max_col = find_rightmost_column(ws, used)
+
+        if tanggal_col is None or max_col is None:
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        found_31_jan = False
-        date_rows = set()
-
         # ---- STEP 1: CHANGE DECEMBER -> JANUARY ----
+        date_rows = set()
+        found_31_jan = False
+
         for r in range(1, used.Rows.Count + 1):
-            for c in range(1, max_col + 1):
-                cell = ws.Cells(r, c)
-                val = cell.Value
+            cell = ws.Cells(r, tanggal_col)
+            val = cell.Value
 
-                if isinstance(val, (datetime, date)):
-                    date_rows.add(r)
+            if isinstance(val, (datetime, date)):
+                date_rows.add(r)
 
-                    if val.month == 12:
-                        cell.Value = val.replace(month=1)
-                        time.sleep(EDIT_DELAY_SECONDS)
+                if val.month == 12:
+                    cell.Value = val.replace(month=1)
+                    time.sleep(EDIT_DELAY_SECONDS)
 
-                    if val.month == 1 and val.day == 31:
-                        found_31_jan = True
+                if val.month == 1 and val.day == 31:
+                    found_31_jan = True
 
         if not found_31_jan:
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        # ---- STEP 2: COLOR + CLEAR MULAI/SELESAI + DECISION CACHE ----
-        mulai_selesai_cols = find_mulai_selesai_columns(ws, used, max_col)
-
-        # Cache row decisions HERE (CRITICAL FIX)
-        row_should_be_gray = {}
+        # ---- STEP 2: CLASSIFY ROWS BASED ONLY ON TANGGAL ----
+        row_is_gray = {}
 
         for r in date_rows:
-            gray = False
+            d = ws.Cells(r, tanggal_col).Value
+            row_is_gray[r] = isinstance(d, (datetime, date)) and d.day in GRAY_DAYS
+
             for c in range(1, max_col + 1):
-                v = ws.Cells(r, c).Value
-                if isinstance(v, (datetime, date)) and v.day in GRAY_DAYS:
-                    gray = True
-                    break
+                ws.Cells(r, c).Interior.ColorIndex = (
+                    COLOR_GRAY if row_is_gray[r] else COLOR_WHITE
+                )
 
-            row_should_be_gray[r] = gray
-
-            # Paint row
-            for c in range(1, max_col + 1):
-                ws.Cells(r, c).Interior.ColorIndex = COLOR_GRAY if gray else COLOR_WHITE
-
-            # Clear mulai / selesai
+        # ---- STEP 3: CLEAR MULAI / SELESAI ----
+        mulai_selesai_cols = find_mulai_selesai_columns(ws, used, max_col)
+        for r in date_rows:
             for c in mulai_selesai_cols:
                 ws.Cells(r, c).Value = None
 
-        # ---- STEP 3: RIGHTMOST COLUMN (LOGIC FROM CACHE, NOT EXCEL) ----
-        for r in date_rows:
-            cell = ws.Cells(r, max_col)
+        # ---- STEP 4: RIGHTMOST COLUMN LOGIC (RUN TWICE) ----
+        for pass_index in range(2):
+            for r in date_rows:
+                cell = ws.Cells(r, max_col)
 
-            if row_should_be_gray[r]:
-                # Gray row → force empty
-                cell.Value = None
-                continue
+                # Always re-evaluate gray on second pass
+                if pass_index == 1:
+                    d = ws.Cells(r, tanggal_col).Value
+                    row_is_gray[r] = (
+                        isinstance(d, (datetime, date)) and d.day in GRAY_DAYS
+                    )
 
-            # White row → autofill if empty
-            if cell.Value in (None, "") and not cell.HasFormula:
-                src_row = find_nearest_formula_above(ws, max_col, r)
-                if src_row is not None:
-                    src = ws.Cells(src_row, max_col)
-                    dest = ws.Range(src, cell)
+                if row_is_gray[r]:
+                    cell.Value = None
+                    cell.Interior.ColorIndex = COLOR_GRAY
+                    continue
 
-                    # Autofill formula (enum 0)
-                    src.AutoFill(dest, 0)
+                if cell.Value in (None, "") and not cell.HasFormula:
+                    src_row = find_nearest_formula_above(ws, max_col, r)
+                    if src_row:
+                        src = ws.Cells(src_row, max_col)
+                        dest = ws.Range(src, cell)
+                        src.AutoFill(dest, 0)
 
-                    # Force color back to white
+                # Explicit repaint on second pass
+                if pass_index == 1:
                     cell.Interior.ColorIndex = COLOR_WHITE
 
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            time.sleep(0.2)
+
+        # ---- STEP 5: NEXT TAB ----
+        next_index = ws.Index + 1 if ws.Index < wb.Worksheets.Count else 1
+        wb.Worksheets(next_index).Activate()
+        time.sleep(1)
 
     except KeyboardInterrupt:
         print("Stopped by user.")
